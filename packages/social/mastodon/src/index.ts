@@ -7,6 +7,14 @@ interface Config {
   visibility?: 'public' | 'unlisted' | 'private' | 'direct';
 }
 
+interface MastodonStatusResponse {
+  id?: string;
+  url?: string;
+  uri?: string;
+  created_at?: string;
+  error?: string;
+}
+
 export default defineSocial<Config>({
   id: 'social-mastodon',
   label: 'Mastodon (Fediverse)',
@@ -18,10 +26,32 @@ export default defineSocial<Config>({
     return { accountId: config.instance };
   },
   async post(ctx, post, config) {
+    const instance = normalizeInstance(config.instance);
+    const token = ctx.secret(tokenSecretKey(instance));
+    if (!token) throw new Error(`Mastodon token for ${instance} not in vault`);
     ctx.log(`mastodon post · ${config.instance} · ${post.body.length} chars`);
     if (ctx.dryRun) return { id: 'dry-run', url: `https://${config.instance}/`, platform: 'mastodon', publishedAt: new Date().toISOString() };
-    // TODO: POST https://${instance}/api/v1/statuses with { status, visibility, media_ids }
-    return { id: `mst_${Date.now()}`, url: `https://${config.instance}/`, platform: 'mastodon', publishedAt: new Date().toISOString() };
+
+    const res = await fetch(`https://${instance}/api/v1/statuses`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        status: formatStatus(post),
+        visibility: config.visibility ?? 'public',
+      }),
+    });
+    const data = await parseStatusResponse(res);
+    if (!res.ok) throw new Error(data.error ?? res.statusText);
+    if (!data.id) throw new Error('Mastodon status response did not include a status id');
+    return {
+      id: data.id,
+      url: data.url ?? data.uri ?? `https://${instance}/`,
+      platform: 'mastodon',
+      publishedAt: new Date(data.created_at ?? Date.now()).toISOString(),
+    };
   },
 
   setup: oauthSetup({
@@ -35,3 +65,23 @@ export default defineSocial<Config>({
     ],
   }),
 });
+
+function tokenSecretKey(instance: string): string {
+  return `MASTODON_TOKEN_${instance.replace(/\./g, '_').toUpperCase()}`;
+}
+
+function normalizeInstance(instance: string): string {
+  return instance.replace(/^https?:\/\//, '').replace(/\/$/, '');
+}
+
+function formatStatus(post: { body: string; link?: string }): string {
+  return post.link ? `${post.body}\n${post.link}` : post.body;
+}
+
+async function parseStatusResponse(res: Response): Promise<MastodonStatusResponse> {
+  try {
+    return await res.json() as MastodonStatusResponse;
+  } catch {
+    return { error: res.statusText };
+  }
+}
